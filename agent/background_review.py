@@ -1059,27 +1059,34 @@ def _run_review_in_thread(
                 # cache READS. A digest is a NOVEL prefix the cache has never
                 # seen, so it bills as cache WRITES (~12.5x the read price).
                 # Trimming history on the main model therefore COSTS MORE, not
-                # less — it is NOT a cost optimization. So:
-                # - Routed to an aux model: the parent cache is unusable by a
-                #   different model anyway (cold prefix regardless), so trimming
-                #   to a digest is a genuine win — fewer cold tokens to write.
-                # - Not routed (main-model path): keep the full snapshot so the
-                #   warm-cache reads still hit. Digest ONLY when the snapshot
-                #   blows past the hard token ceiling — there the digest is a
-                #   runaway-cost BOUND (capping the ~296K-token bleed), accepted
-                #   as the lesser evil, not a routine saver. Do NOT lower the
-                #   ceiling to "save money" on normal sessions; it backfires.
-                #   0 disables the guard entirely.
+                # less — it is NOT a cost optimization. The policy, by case:
+                #
+                #   SAME MODEL (not routed):
+                #     • normal session  -> replay FULL history. It's warm in the
+                #       cache, so it's cheap reads. This is optimal; do nothing.
+                #     • runaway session (over max_context_tokens) -> digest as a
+                #       last-resort BOUND only. Eating a cache-write here is the
+                #       lesser evil vs a ~296K-token bleed. Rare by design.
+                #   DIFFERENT MODEL (routed):
+                #     • ALWAYS digest. The aux model can't read the parent's
+                #       cache anyway (cold regardless), so replaying the full
+                #       history would just cold-write a giant transcript. The
+                #       digest cold-writes far less -> maximal saving. Pure win.
                 _budget = _read_review_budget()
                 _max_ctx = _budget["max_context_tokens"]
                 _full_tokens = _rough_token_count(messages_snapshot)
-                _engage_digest = _routed or (
-                    _max_ctx > 0 and _full_tokens > _max_ctx
+                _over_ceiling = _max_ctx > 0 and _full_tokens > _max_ctx
+                # Routed -> always digest (pure win). Same-model -> only when a
+                # runaway trips the ceiling (lesser-evil bound).
+                _engage_digest = _routed or _over_ceiling
+                _digest_reason = (
+                    "routed-aux-model" if _routed
+                    else ("runaway-bound" if _over_ceiling else None)
                 )
                 if _engage_digest:
-                    # Effective ceiling: the configured cap, or a sane default
-                    # when routed with the guard disabled (routing means the
-                    # cache-share is gone, so we always bound the replay).
+                    # When routed with no ceiling configured, still bound the
+                    # cold-write replay to a sane default so we don't cold-write
+                    # the whole transcript on the aux model.
                     _eff_ctx = _max_ctx if _max_ctx > 0 else 48000
                     _review_history, _digest_meta = _build_review_history(
                         messages_snapshot, _eff_ctx, _budget["digest_tail_messages"],
@@ -1087,9 +1094,10 @@ def _run_review_in_thread(
                         agent_runtime=agent._current_main_runtime(),
                     )
                     logger.info(
-                        "bg-review context: routed=%s digested=%s prepass=%s "
+                        "bg-review context: reason=%s routed=%s digested=%s prepass=%s "
                         "full=%d→replayed=%d tokens (%d→%d msgs)",
-                        _routed, _digest_meta["digested"], _digest_meta.get("prepass_used"),
+                        _digest_reason, _routed, _digest_meta["digested"],
+                        _digest_meta.get("prepass_used"),
                         _digest_meta["full_tokens"], _digest_meta["replayed_tokens"],
                         _digest_meta["full_messages"], _digest_meta["replayed_messages"],
                     )

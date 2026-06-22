@@ -107,7 +107,11 @@ JUDGE_SYSTEM_PROMPT = (
     "progress is genuinely gated on something running on its own:\n"
     "- A background process listed below is still running AND the response "
     "shows the agent is waiting on its result (e.g. a CI poller, build, "
-    "test run, deploy) — return its pid in ``wait_on_pid``.\n"
+    "test run, deploy). If the process has a session id, return it in "
+    "``wait_on_session`` — that releases when the process exits OR its "
+    "watch_patterns trigger fires (use this for a long-lived watcher that "
+    "signals mid-run and may never exit). Otherwise return its pid in "
+    "``wait_on_pid`` (releases on exit only).\n"
     "- The agent says it is rate-limited / backing off / must wait a fixed "
     "period — return seconds in ``wait_for_seconds``.\n"
     "Picking WAIT parks the loop without burning a turn; it resumes "
@@ -120,6 +124,7 @@ JUDGE_SYSTEM_PROMPT = (
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
     "The legacy shape {\"done\": <true|false>, \"reason\": \"...\"} is still "
@@ -197,14 +202,20 @@ class GoalState:
     # background-process list and can return a ``wait`` verdict) or manually
     # via ``/goal wait``:
     #   • ``waiting_on_pid`` — park until that process exits.
+    #   • ``waiting_on_session`` — park until that process_registry session's
+    #     OWN trigger fires: it exits, OR (if it has watch_patterns) its
+    #     pattern matches. Covers long-lived watchers/servers that signal
+    #     mid-run via a trigger and may never exit. Preferred over raw pid
+    #     when the agent set up a watch_patterns/notify_on_complete process.
     #   • ``waiting_until``  — park until this wall-clock epoch (time backoff).
-    # While EITHER is active, ``evaluate_after_turn`` short-circuits to
+    # While ANY is active, ``evaluate_after_turn`` short-circuits to
     # should_continue=False without burning a turn or calling the judge. The
-    # barrier auto-clears when the pid exits / the deadline passes, then the
-    # next turn resumes normal judging. Cleared by pid-exit, deadline,
+    # barrier auto-clears when the pid exits / the trigger fires / the deadline
+    # passes, then the next turn resumes normal judging. Cleared by that,
     # ``/goal unwait``, pause, resume, or clear. Backwards-compatible: old
     # state_meta rows load with no barrier.
     waiting_on_pid: Optional[int] = None
+    waiting_on_session: Optional[str] = None
     waiting_until: float = 0.0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
@@ -232,6 +243,7 @@ class GoalState:
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             subgoals=subgoals,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
+            waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
@@ -411,6 +423,24 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _session_waiting(session_id: str) -> bool:
+    """Whether a goal parked on a process_registry session should stay parked.
+
+    Delegates to ``process_registry.is_session_waiting`` — True while the
+    session is running and (if it has watch_patterns) its trigger hasn't fired.
+    Fail-safe: any import/registry error yields False (don't wait) so a stale
+    barrier can never wedge the loop.
+    """
+    if not session_id:
+        return False
+    try:
+        from tools.process_registry import process_registry
+
+        return bool(process_registry.is_session_waiting(session_id))
+    except Exception:
+        return False
+
+
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 
@@ -520,6 +550,11 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
                 continue
         return None
 
+    # Prefer a session-id directive (releases on the process's own trigger —
+    # exit OR watch-pattern match), then pid (exit only), then seconds.
+    sess = data.get("wait_on_session") or data.get("session_id") or data.get("wait_session")
+    if isinstance(sess, str) and sess.strip():
+        return "wait", reason, False, {"session_id": sess.strip()}
     pid = _first_int("wait_on_pid", "pid", "wait_pid")
     if pid is not None:
         return "wait", reason, False, {"pid": pid}
@@ -527,7 +562,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
     # Wait with no usable target — can't park on nothing; treat as continue.
-    return "continue", f"{reason} (wait verdict had no pid/seconds — continuing)", False, None
+    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -553,9 +588,21 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
         cmd = _truncate(str(p.get("command") or "").replace("\n", " ").strip(), 120)
         uptime = p.get("uptime_seconds")
         tail = _truncate(str(p.get("output_preview") or "").replace("\n", " ").strip(), 120)
-        line = f"- pid {pid}: {cmd}"
+        sid = p.get("session_id")
+        line = f"- pid {pid}"
+        if sid:
+            line += f" / session {sid}"
+        line += f": {cmd}"
         if uptime is not None:
             line += f" (running {uptime}s)"
+        # Surface the process's own trigger so the judge can wait on a
+        # mid-run signal (watch-pattern) or completion, not just exit.
+        wps = p.get("watch_patterns")
+        if wps:
+            hit = " [already matched]" if p.get("watch_hit") else ""
+            line += f" | watch_patterns={wps}{hit}"
+        elif p.get("notify_on_complete"):
+            line += " | notify_on_complete"
         if tail:
             line += f" | recent output: {tail}"
         lines.append(line)
@@ -735,6 +782,9 @@ class GoalManager:
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         if s.status == "active":
+            if s.waiting_on_session and _session_waiting(s.waiting_on_session):
+                wr = s.waiting_reason or f"session {s.waiting_on_session}"
+                return f"⏳ Goal (parked on {wr}, {turns}{sub}): {s.goal}"
             if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
                 wr = s.waiting_reason or f"pid {s.waiting_on_pid}"
                 return f"⏳ Goal (parked on {wr}, {turns}{sub}): {s.goal}"
@@ -775,6 +825,7 @@ class GoalManager:
         self._state.paused_reason = reason
         # A wait barrier is meaningless once paused — drop it.
         self._state.waiting_on_pid = None
+        self._state.waiting_on_session = None
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
@@ -788,6 +839,7 @@ class GoalManager:
         self._state.paused_reason = None
         # Resuming starts fresh — clear any stale barrier.
         self._state.waiting_on_pid = None
+        self._state.waiting_on_session = None
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
@@ -866,9 +918,10 @@ class GoalManager:
         While the PID is alive, ``evaluate_after_turn`` returns
         ``should_continue=False`` without burning a turn or calling the
         judge — the loop quiesces instead of re-poking the agent into busy
-        work. The barrier auto-clears when the process exits (the agent's
-        ``notify_on_complete`` background watcher is the natural wake
-        signal). Requires an active goal.
+        work. The barrier auto-clears when the process exits. Requires an
+        active goal. For a process with a watch_patterns/notify_on_complete
+        trigger, prefer ``wait_on_session`` so a mid-run trigger (not just
+        exit) releases the barrier.
         """
         if self._state is None or self._state.status != "active":
             raise RuntimeError("no active goal to park")
@@ -876,6 +929,29 @@ class GoalManager:
         if pid <= 0:
             raise ValueError("pid must be a positive integer")
         self._state.waiting_on_pid = pid
+        self._state.waiting_on_session = None
+        self._state.waiting_until = 0.0
+        self._state.waiting_reason = (reason or "").strip() or None
+        self._state.waiting_since = time.time()
+        save_goal(self.session_id, self._state)
+        return self._state
+
+    def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
+        """Park the goal loop on a process_registry session's OWN trigger.
+
+        Unlike ``wait_on`` (which releases only on PID exit), this releases
+        when the session's trigger fires: it exits, OR — if it was started
+        with ``watch_patterns`` — its pattern matches. This is the right
+        barrier for a long-lived watcher/server/poller that signals mid-run
+        and may never exit. Requires an active goal.
+        """
+        if self._state is None or self._state.status != "active":
+            raise RuntimeError("no active goal to park")
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            raise ValueError("session_id must be a non-empty string")
+        self._state.waiting_on_session = session_id
+        self._state.waiting_on_pid = None
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
@@ -896,6 +972,7 @@ class GoalManager:
         if seconds <= 0:
             raise ValueError("seconds must be a positive integer")
         self._state.waiting_on_pid = None
+        self._state.waiting_on_session = None
         self._state.waiting_until = time.time() + seconds
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
@@ -903,13 +980,18 @@ class GoalManager:
         return self._state
 
     def stop_waiting(self) -> bool:
-        """Clear any active wait barrier (pid- or time-based). Returns True
+        """Clear any active wait barrier (pid / session / time). Returns True
         if one was cleared."""
         if self._state is None:
             return False
-        if self._state.waiting_on_pid is None and not self._state.waiting_until:
+        if (
+            self._state.waiting_on_pid is None
+            and self._state.waiting_on_session is None
+            and not self._state.waiting_until
+        ):
             return False
         self._state.waiting_on_pid = None
+        self._state.waiting_on_session = None
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
@@ -919,13 +1001,19 @@ class GoalManager:
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied.
 
-        Pid barrier: alive iff the process is still running. Time barrier:
-        active until the deadline passes. Side effect: a satisfied barrier
-        (process exited / deadline passed) is cleared here (lazy auto-clear)
-        so the next evaluation resumes normal judging.
+        Session barrier: active until the process exits or its watch-pattern
+        trigger fires. Pid barrier: active while the process is alive. Time
+        barrier: active until the deadline passes. Side effect: a satisfied
+        barrier is cleared here (lazy auto-clear) so the next evaluation
+        resumes normal judging.
         """
         s = self._state
         if s is None:
+            return False
+        if s.waiting_on_session is not None:
+            if _session_waiting(s.waiting_on_session):
+                return True
+            self.stop_waiting()  # session exited or trigger fired
             return False
         if s.waiting_on_pid is not None:
             if _pid_alive(s.waiting_on_pid):
@@ -982,7 +1070,9 @@ class GoalManager:
         # deadline that hasn't passed), quiesce — do NOT burn a turn or call
         # the judge. Resumes automatically once the barrier clears.
         if self.is_waiting():
-            if state.waiting_on_pid is not None:
+            if state.waiting_on_session is not None:
+                tgt = f"session {state.waiting_on_session}"
+            elif state.waiting_on_pid is not None:
                 tgt = f"pid {state.waiting_on_pid}"
             else:
                 remaining = max(0, int(state.waiting_until - time.time()))
@@ -1025,7 +1115,10 @@ class GoalManager:
         # exits or the deadline passes (next evaluate_after_turn falls through
         # the is_waiting() short-circuit once the barrier clears).
         if verdict == "wait" and wait_directive:
-            if wait_directive.get("pid"):
+            if wait_directive.get("session_id"):
+                self.wait_on_session(str(wait_directive["session_id"]), reason=reason)
+                tgt = f"session {wait_directive['session_id']}"
+            elif wait_directive.get("pid"):
                 self.wait_on(int(wait_directive["pid"]), reason=reason)
                 tgt = f"pid {wait_directive['pid']}"
             else:

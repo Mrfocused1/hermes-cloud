@@ -1097,3 +1097,125 @@ class TestJudgeDrivenWait:
         assert decision["verdict"] == "continue"
         assert decision["should_continue"] is True
         assert mgr.state.waiting_on_pid is None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Session/trigger barrier — wait on a process's OWN trigger, not just exit
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestSessionTriggerBarrier:
+    """The session barrier (wait_on_session) releases when a process's own
+    trigger fires — a watch_patterns match mid-run (process may never exit)
+    OR exit — not only on PID exit. CI-safe: uses synthetic registry session
+    objects, no real child processes."""
+
+    @staticmethod
+    def _inject(sid, *, watch_patterns=None, exited=False):
+        import time as _t
+        from tools.process_registry import process_registry, ProcessSession
+        s = ProcessSession(id=sid, command="watcher.sh", task_id="t",
+                           session_key="", cwd="/tmp", started_at=_t.time())
+        if watch_patterns:
+            s.watch_patterns = list(watch_patterns)
+        s.exited = exited
+        if exited:
+            process_registry._finished[sid] = s
+        else:
+            process_registry._running[sid] = s
+        return s, process_registry
+
+    def test_registry_is_session_waiting_running_unmatched(self, hermes_home):
+        s, reg = self._inject("proc_t1", watch_patterns=["READY"])
+        assert reg.is_session_waiting("proc_t1") is True
+
+    def test_registry_releases_on_watch_match_while_alive(self, hermes_home):
+        s, reg = self._inject("proc_t2", watch_patterns=["READY"])
+        assert reg.is_session_waiting("proc_t2") is True
+        s._watch_hits = 1  # what _check_watch_patterns sets on a match
+        # Released even though the process is STILL running (never exited).
+        assert s.exited is False
+        assert reg.is_session_waiting("proc_t2") is False
+
+    def test_registry_releases_on_exit_plain_session(self, hermes_home):
+        s, reg = self._inject("proc_t3")  # no watch pattern
+        assert reg.is_session_waiting("proc_t3") is True
+        s.exited = True
+        assert reg.is_session_waiting("proc_t3") is False
+
+    def test_registry_unknown_session_never_waits(self, hermes_home):
+        from tools.process_registry import process_registry
+        assert process_registry.is_session_waiting("proc_does_not_exist") is False
+
+    def test_goal_parks_on_session_and_releases_on_trigger(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        s, reg = self._inject("proc_t4", watch_patterns=["BUILD SUCCESSFUL"])
+        mgr = GoalManager(session_id="st-goal", default_max_turns=10)
+        mgr.set("wait for the build to succeed")
+        with patch.object(
+            goals, "judge_goal",
+            return_value=("wait", "blocked on build", False, {"session_id": "proc_t4"}),
+        ):
+            decision = mgr.evaluate_after_turn(
+                "Started the build watcher.",
+                background_processes=[{
+                    "session_id": "proc_t4", "pid": 4242, "command": "watcher.sh",
+                    "status": "running", "watch_patterns": ["BUILD SUCCESSFUL"],
+                    "watch_hit": False,
+                }],
+            )
+        assert decision["verdict"] == "wait"
+        assert mgr.state.waiting_on_session == "proc_t4"
+        assert mgr.is_waiting() is True
+
+        # Judge must NOT be called again while parked.
+        judge = MagicMock()
+        with patch.object(goals, "judge_goal", judge):
+            d2 = mgr.evaluate_after_turn("still building")
+        judge.assert_not_called()
+        assert d2["should_continue"] is False
+
+        # Trigger fires mid-run (process still alive) → barrier releases.
+        s._watch_hits = 1
+        assert mgr.is_waiting() is False
+        assert mgr.state.waiting_on_session is None
+
+        # Loop resumes with a real judge verdict.
+        with patch.object(goals, "judge_goal",
+                          return_value=("continue", "build done", False, None)):
+            d3 = mgr.evaluate_after_turn("build succeeded")
+        assert d3["should_continue"] is True
+
+    def test_wait_on_session_validation(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_id="st-val")
+        # No active goal → RuntimeError
+        try:
+            mgr.wait_on_session("proc_x")
+            assert False, "expected RuntimeError"
+        except RuntimeError:
+            pass
+        mgr.set("g")
+        try:
+            mgr.wait_on_session("")
+            assert False, "expected ValueError"
+        except ValueError:
+            pass
+
+    def test_session_directive_parsed_from_judge(self, hermes_home):
+        from hermes_cli.goals import _parse_judge_response
+        v, _, pf, wd = _parse_judge_response(
+            '{"verdict": "wait", "wait_on_session": "proc_abc", "reason": "r"}'
+        )
+        assert v == "wait"
+        assert pf is False
+        assert wd == {"session_id": "proc_abc"}
+
+    def test_old_state_loads_without_session_field(self, hermes_home):
+        from hermes_cli.goals import GoalState
+        st = GoalState.from_json(json.dumps({
+            "goal": "g", "status": "active", "turns_used": 0, "max_turns": 20,
+        }))
+        assert st.waiting_on_session is None

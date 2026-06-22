@@ -13,6 +13,10 @@ metadata:
 
 # GSAP Awwwards-Calibre Sites (Bridgeway house style)
 
+<!-- Live on Mac Hermes (~/.hermes/skills/creative/). Committed to Railway image source
+     (Mrfocused1/hermes-cloud skills/creative/gsap-awwwards-sites). Reaches the live
+     Railway bot only after the next image REBUILD — verify with /gsap-awwwards-sites. -->
+
 ## Overview
 
 Build a single, self-contained `index.html` that looks and moves like an Awwwards site of the day: an immersive, scripted GSAP experience, not a static page with a few fades. This skill carries Bridgeway's **house vocabulary** (stack, palette posture, motion grammar, build/verify discipline) — but the **concept is derived fresh for every brief**. There is no fixed template; a charity, a streetwear drop, a barber, and a law firm should each get a different idea built from the same craftsmanship.
@@ -79,7 +83,10 @@ Motion must feel **fast and intentional** — restraint over flash. Every animat
 ## Accessibility & Fail-Safes (non-negotiable)
 
 - **Content visible by default.** Animations only ENHANCE. If a ScrollTrigger never fires, the content must still be readable.
-- **Force-reveal safety net.** Add a `window` `load` listener that force-reveals any reveal-targeted elements after ~3s (set opacity/transform to final), so nothing can be left stuck hidden by a missed trigger.
+- **The loader/curtain is the #1 blank-screen risk — it MUST self-dismiss without JS.** Any full-screen loader or curtain panel that covers content must lift via a CSS `@keyframes … forwards` animation (or a `setTimeout` removal), so a slow or failed GSAP CDN can NEVER leave it covering the page. GSAP then re-drives it for the polished version; the CSS is the guarantee, not the JS.
+- **Never hide content with CSS that only JS can un-hide.** Reveal targets must either start visible, or be hidden by `gsap.set()` in the SAME `<script>` that animates them — so if that script never loads, nothing was hidden in the first place.
+- **Do NOT patch a blank screen with `!important`.** Forcing `clip-path`/`opacity … !important` to make content visible beats GSAP's inline styles and silently KILLS the reveal animation. Fix the cause (loader self-dismiss + JS-applied hide) instead.
+- **Force-reveal safety net.** Add a `window` `load` listener that force-reveals any reveal-targeted elements after ~3s (set opacity/transform to final, no `!important`), so nothing can be left stuck hidden by a missed trigger.
 - **prefers-reduced-motion.** Wrap heavy motion in `gsap.matchMedia()` and reduce/disable it when the user prefers reduced motion; keep all content visible.
 - **Mobile-first.** Responsive; simplify or drop heavy effects (pins, parallax) on small screens via `matchMedia("(min-width: 768px)")`.
 - After any DOM/layout/font change that affects positions, call `ScrollTrigger.refresh()`.

@@ -350,6 +350,13 @@ if [ -f "$HERMES_HOME/config.yaml" ] && ! grep -q "fallback_providers" "$HERMES_
     as_hermes sh -c "printf '\nfallback_providers:\n  - provider: zai\n    model: glm-4.6\n' >> '$HERMES_HOME/config.yaml'" 2>/dev/null || true
 fi
 
+# --- Ensure STT (Groq free Whisper) config (idempotent, non-fatal) ---
+# Free hosted open-source Whisper (large-v3-turbo) via GROQ_API_KEY; zero
+# in-container compute. Grep-guarded, wrapped so it can NEVER block boot.
+if [ -f "$HERMES_HOME/config.yaml" ] && ! grep -q "^stt:" "$HERMES_HOME/config.yaml" 2>/dev/null; then
+    as_hermes sh -c "printf '\nstt:\n  enabled: true\n  provider: groq\n' >> '$HERMES_HOME/config.yaml'" 2>/dev/null || true
+fi
+
 # auth.json: bootstrap from env on first boot only. Same semantics as the
 # pre-s6 entrypoint — the [ ! -f ] guard is critical to avoid clobbering
 # rotated refresh tokens on container restart.

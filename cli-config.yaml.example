@@ -1,3 +1,7 @@
 model:
   provider: zai
   default: glm-5.2
+
+fallback_providers:
+  - provider: zai
+    model: glm-4.6

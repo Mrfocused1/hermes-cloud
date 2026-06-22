@@ -342,6 +342,14 @@ if [ -f "$HERMES_HOME/config.yaml" ]; then
         || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
 fi
 
+# --- Ensure model fallback chain (idempotent, non-fatal) ---
+# Same-provider glm-4.6 fallback so a transient glm-5.2 error fails over within
+# the turn instead of dropping it. Grep-guarded (appends at most once) and
+# wrapped so it can NEVER block boot.
+if [ -f "$HERMES_HOME/config.yaml" ] && ! grep -q "fallback_providers" "$HERMES_HOME/config.yaml" 2>/dev/null; then
+    as_hermes sh -c "printf '\nfallback_providers:\n  - provider: zai\n    model: glm-4.6\n' >> '$HERMES_HOME/config.yaml'" 2>/dev/null || true
+fi
+
 # auth.json: bootstrap from env on first boot only. Same semantics as the
 # pre-s6 entrypoint — the [ ! -f ] guard is critical to avoid clobbering
 # rotated refresh tokens on container restart.

@@ -5,3 +5,7 @@ model:
 fallback_providers:
   - provider: zai
     model: glm-4.6
+
+stt:
+  enabled: true
+  provider: groq

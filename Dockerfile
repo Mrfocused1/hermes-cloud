@@ -316,7 +316,7 @@ ENV HERMES_DISABLE_LAZY_INSTALLS=1
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# VOLUME (removed for Railway) [ "/opt/data" ]
 
 # s6-overlay's /init is PID 1. It sets up the supervision tree, runs
 # /etc/cont-init.d/* (our stage2 hook), starts s6-rc services

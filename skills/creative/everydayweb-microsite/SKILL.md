@@ -61,6 +61,25 @@ node ~/.hermes/skills/creative/everydayweb-microsite/scripts/clone-rebrand.mjs \
 
 Completion: the script printed `ok:true` with a `url` and a `commit`.
 
+## Video heroes (optional — lifestyle businesses only)
+
+The templates' `PageHero` accepts an optional `video` prop: pass an mp4 and it
+plays muted-looping behind the headline, with the hero image as poster/fallback
+(reduced-motion users get the still). Use it ONLY for businesses Coverr has good
+footage for — **gym, salon, spa, restaurant/café, hospitality, property, beauty,
+fitness, wellness**. Do NOT use it for product or trade brands (printing, garments,
+electrical, builders) — real product photos read better and Coverr has no fitting
+footage; a generic stock clip there looks worse than an image.
+
+To add one: fetch a landscape clip, then pass its path as `video` on the hero(s).
+```bash
+node <skill>/scripts/fetch-coverr.mjs --theme "boutique gym" \
+  --out public/marketing/<key>/hero.mp4 --poster public/marketing/<key>/hero-poster.jpg
+# then in the route's page, e.g.:  <PageHero ... img={IMG.heroX} video="/marketing/<key>/hero.mp4" />
+```
+The clip is ~2–3 MB (one per site, fine). If `fetch-coverr` returns `ok:false`
+("no landscape clip"), the theme has no good footage — skip video, keep the image.
+
 ## Verify (you do this — GLM vision QA)
 
 This is the quality gate. After the push, Vercel needs ~1–2 min to build.
